@@ -727,7 +727,7 @@ public:
   ClangModuleUnit *getClangModuleForMacro(const clang::MacroInfo *MI);
 
   /// Retrieve the type of an instance of the given Clang declaration context,
-  /// or a null type if the DeclContext does not have a correspinding type.
+  /// or a null type if the DeclContext does not have a corresponding type.
   clang::QualType getClangDeclContextType(const clang::DeclContext *dc);
 
   /// Determine whether this typedef is a CF type.
@@ -1214,7 +1214,7 @@ public:
     SmallVector<ProtocolConformance *, 4> result
       = std::move(conformances->second);
     DelayedConformances.erase(conformances);
-    return std::move(result);
+    return result;
   }
 
   /// Record the set of imported protocols for the given declaration,

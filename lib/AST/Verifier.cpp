@@ -246,7 +246,7 @@ struct ASTNodeBase {};
 #undef DISPATCH
       }
 
-      llvm_unreachable("Unhandled declaratiom kind");
+      llvm_unreachable("Unhandled declaration kind");
     }
 
   private:
@@ -436,7 +436,7 @@ struct ASTNodeBase {};
             return false;
 
           // We should know about archetypes corresponding to opened
-          // existerntial archetypes.
+          // existential archetypes.
           if (archetype->getOpenedExistentialType()) {
             if (OpenedExistentialArchetypes.count(archetype) == 0) {
               Out << "Found opened existential archetype "

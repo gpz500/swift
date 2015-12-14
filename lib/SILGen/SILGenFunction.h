@@ -31,14 +31,6 @@ class LValue;
 class ManagedValue;
 class RValue;
 class TemporaryInitialization;
-
-/// How a method is dispatched.
-enum class MethodDispatch {
-  // The method implementation can be referenced statically.
-  Static,
-  // The method implementation uses class_method dispatch.
-  Class,
-};
   
 /// Internal context information for the SILGenFunction visitor.
 ///
@@ -695,7 +687,7 @@ public:
   ///                    argument of this type to receive the return value for
   ///                    the function.
   /// \param isThrowing  If true, create an error epilog block.
-  /// \param L           The SILLocation which should be accosocated with
+  /// \param L           The SILLocation which should be associated with
   ///                    cleanup instructions.
   void prepareEpilog(Type returnType, bool isThrowing, CleanupLocation L);
   void prepareRethrowEpilog(CleanupLocation l);
@@ -1540,9 +1532,6 @@ public:
   /// intrinsic.
   Substitution getPointerSubstitution(Type pointerType,
                                       ArchetypeType *archetype);
-  
-  /// Get the method dispatch mechanism for a method.
-  MethodDispatch getMethodDispatch(AbstractFunctionDecl *method);
 };
 
 

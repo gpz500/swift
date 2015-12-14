@@ -51,7 +51,7 @@ For OS X, you need [the latest Xcode](https://developer.apple.com/xcode/download
 
 For Ubuntu, you'll need the following development dependencies:
 
-    sudo apt-get install git cmake ninja-build clang uuid-dev libicu-dev icu-devtools libbsd-dev libedit-dev libxml2-dev libsqlite3-dev swig libpython-dev libncurses5-dev pkg-config
+    sudo apt-get install git cmake ninja-build clang python uuid-dev libicu-dev icu-devtools libbsd-dev libedit-dev libxml2-dev libsqlite3-dev swig libpython-dev libncurses5-dev pkg-config
 
 Note: LLDB currently requires at least swig-1.3.40 but will successfully build
 with version 2 shipped with Ubuntu.
@@ -77,7 +77,7 @@ uploading SSH keys to GitHub):
 
     git clone git@github.com:apple/swift.git
     cd swift
-    ./utils/update-checkout --clone-via-ssh
+    ./utils/update-checkout --clone-with-ssh
 
 [CMake](http://cmake.org) is the core infrastructure used to configure builds of
 Swift and its companion projects; at least version 2.8.12.2 is required. Your

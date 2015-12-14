@@ -4186,6 +4186,7 @@ public:
         switch (S->getKind()) {
         case StmtKind::Return:
         case StmtKind::ForEach:
+        case StmtKind::RepeatWhile:
           return true;
         default:
           return false;
@@ -4246,6 +4247,15 @@ public:
                                 ParsedExpr->getSourceRange())) {
              Callback(Context.getSequenceTypeDecl()->getDeclaredInterfaceType());
            }
+         }
+         break;
+       }
+       case StmtKind::RepeatWhile: {
+         auto Cond = cast<RepeatWhileStmt>(Parent)->getCond();
+         if (Cond &&
+             SM.rangeContains(Cond->getSourceRange(),
+                              ParsedExpr->getSourceRange())) {
+           Callback(Context.getBoolDecl()->getDeclaredType());
          }
          break;
        }
@@ -4433,7 +4443,7 @@ void CodeCompletionCallbacksImpl::doneParsing() {
         Lookup.setHaveRParen(HasRParen);
         Lookup.getValueExprCompletions(*ExprType);
       } else {
-        // Add argument labels, then fallthough to get values.
+        // Add argument labels, then fallthrough to get values.
         Lookup.addArgNameCompletionResults(PossibleNames);
       }
     }
