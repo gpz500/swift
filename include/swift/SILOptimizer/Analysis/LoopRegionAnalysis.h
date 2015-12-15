@@ -399,6 +399,10 @@ private:
     /// Subregions array by the RPO number of its header.
     llvm::SmallVector<std::pair<unsigned, unsigned>, 2> Subloops;
 
+    /// A list of subregions with non-local successors. This is the actual ID
+    /// of the subregion since we do not care about any ordering.
+    llvm::SmallVector<unsigned, 2> ExitingSubregions;
+
     subregion_iterator begin() const {
       return subregion_iterator(Subregions.begin(), &Subloops);
     }
@@ -496,6 +500,14 @@ public:
   bool containsSubregion(LoopRegion *R) {
     auto End = subregion_end();
     return std::find(subregion_begin(), End, R->getID()) != End;
+  }
+
+  /// Returns an ArrayRef containing IDs of the exiting subregions of this
+  /// region. The exit regions associated with the exiting subregions are the
+  /// end points of the non-local edges. This asserts if this is a region
+  /// representing a block.
+  ArrayRef<unsigned> getExitingSubregions() const {
+    return getSubregionData().ExitingSubregions;
   }
 
   using pred_const_iterator = decltype(Preds)::const_iterator;
@@ -717,7 +729,7 @@ class LoopRegionFunctionInfo {
 
   /// A map from an unsigned integer ID to a region.
   ///
-  /// *WARNING* Before modifying the initializiation of this field of the data
+  /// *WARNING* Before modifying the initialization of this field of the data
   /// structure please read the comment below:
   ///
   /// We assign IDs to BBs, Loops, and the top level Function, so that we can

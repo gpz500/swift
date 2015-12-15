@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-devirtualize-utility"
+#include "swift/SILOptimizer/Analysis/ClassHierarchyAnalysis.h"
 #include "swift/SILOptimizer/Utils/Devirtualize.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Types.h"
@@ -33,13 +34,194 @@ STATISTIC(NumWitnessDevirt, "Number of witness_method applies devirtualized");
 //                         Class Method Optimization
 //===----------------------------------------------------------------------===//
 
+/// Compute all subclasses of a given class.
+///
+/// \p CHA class hierarchy analysis
+/// \p CD class declaration
+/// \p ClassType type of the instance
+/// \p M SILModule
+/// \p Subs a container to be used for storing the set of subclasses
+static void getAllSubclasses(ClassHierarchyAnalysis *CHA,
+                             ClassDecl *CD,
+                             SILType ClassType,
+                             SILModule &M,
+                             ClassHierarchyAnalysis::ClassList &Subs) {
+  // Collect the direct and indirect subclasses for the class.
+  // Sort these subclasses in the order they should be tested by the
+  // speculative devirtualization. Different strategies could be used,
+  // E.g. breadth-first, depth-first, etc.
+  // Currently, let's use the breadth-first strategy.
+  // The exact static type of the instance should be tested first.
+  auto &DirectSubs = CHA->getDirectSubClasses(CD);
+  auto &IndirectSubs = CHA->getIndirectSubClasses(CD);
+
+  Subs.append(DirectSubs.begin(), DirectSubs.end());
+  //SmallVector<ClassDecl *, 8> Subs(DirectSubs);
+  Subs.append(IndirectSubs.begin(), IndirectSubs.end());
+
+  if (isa<BoundGenericClassType>(ClassType.getSwiftRValueType())) {
+    // Filter out any subclassses that do not inherit from this
+    // specific bound class.
+    auto RemovedIt = std::remove_if(Subs.begin(), Subs.end(),
+        [&ClassType, &M](ClassDecl *Sub){
+          auto SubCanTy = Sub->getDeclaredType()->getCanonicalType();
+          // Unbound generic type can override a method from
+          // a bound generic class, but this unbound generic
+          // class is not considered to be a subclass of a
+          // bound generic class in a general case.
+          if (isa<UnboundGenericType>(SubCanTy))
+            return false;
+          // Handle the ususal case here: the class in question
+          // should be a real subclass of a bound generic class.
+          return !ClassType.isSuperclassOf(
+              SILType::getPrimitiveObjectType(SubCanTy));
+        });
+    Subs.erase(RemovedIt, Subs.end());
+  }
+}
+
+/// \brief Returns true, if a method implementation corresponding to
+/// the class_method applied to an instance of the class CD is
+/// effectively final, i.e. it is statically known to be not overridden
+/// by any subclasses of the class CD.
+///
+/// \p AI  invocation instruction
+/// \p ClassType type of the instance
+/// \p CD  static class of the instance whose method is being invoked
+/// \p CHA class hierarchy analysis
+bool isEffectivelyFinalMethod(FullApplySite AI,
+                              SILType ClassType,
+                              ClassDecl *CD,
+                              ClassHierarchyAnalysis *CHA) {
+  if (CD && CD->isFinal())
+    return true;
+
+  const DeclContext *DC = AI.getModule().getAssociatedContext();
+
+  // Without an associated context we cannot perform any
+  // access-based optimizations.
+  if (!DC)
+    return false;
+
+  auto *CMI = cast<MethodInst>(AI.getCallee());
+
+  if (!calleesAreStaticallyKnowable(AI.getModule(), CMI->getMember()))
+    return false;
+
+  auto *Method = CMI->getMember().getAbstractFunctionDecl();
+  assert(Method && "Expected abstract function decl!");
+  assert(!Method->isFinal() && "Unexpected indirect call to final method!");
+
+  // If this method is not overridden in the module,
+  // there is no other implementation.
+  if (!Method->isOverridden())
+    return true;
+
+  // Class declaration may be nullptr, e.g. for cases like:
+  // func foo<C:Base>(c: C) {}, where C is a class, but
+  // it does not have a class decl.
+  if (!CD)
+    return false;
+
+  if (!CHA)
+    return false;
+
+  // This is a private or a module internal class.
+  //
+  // We can analyze the class hierarchy rooted at it and
+  // eventually devirtualize a method call more efficiently.
+
+  ClassHierarchyAnalysis::ClassList Subs;
+  getAllSubclasses(CHA, CD, ClassType, AI.getModule(), Subs);
+
+  // This is the implementation of the method to be used
+  // if the exact class of the instance would be CD.
+  auto *ImplMethod = CD->findImplementingMethod(Method);
+
+  // First, analyze all direct subclasses.
+  for (auto S : Subs) {
+    // Check if the subclass overrides a method and provides
+    // a different implementation.
+    auto *ImplFD = S->findImplementingMethod(Method);
+    if (ImplFD != ImplMethod)
+      return false;
+  }
+
+  return true;
+}
+
+/// Check if a given class is final in terms of a current
+/// compilation, i.e.:
+/// - it is really final
+/// - or it is private and has not sub-classes
+/// - or it is an internal class without sub-classes and
+///   it is a whole-module compilation.
+static bool isKnownFinalClass(ClassDecl *CD, SILModule &M,
+                              ClassHierarchyAnalysis *CHA) {
+  const DeclContext *DC = M.getAssociatedContext();
+
+  if (CD->isFinal())
+    return true;
+
+  // Without an associated context we cannot perform any
+  // access-based optimizations.
+  if (!DC)
+    return false;
+
+  // Only handle classes defined within the SILModule's associated context.
+  if (!CD->isChildContextOf(DC))
+    return false;
+
+  if (!CD->hasAccessibility())
+    return false;
+
+  // Only consider 'private' members, unless we are in whole-module compilation.
+  switch (CD->getEffectiveAccess()) {
+  case Accessibility::Public:
+    return false;
+  case Accessibility::Internal:
+    if (!M.isWholeModule())
+      return false;
+    break;
+  case Accessibility::Private:
+    break;
+  }
+
+  // Take the ClassHieararchyAnalysis into account.
+  // If a given class has no subclasses and
+  // - private
+  // - or internal and it is a WMO compilation
+  // then this class can be considered final for the purpose
+  // of devirtualization.
+  if (CHA) {
+    if (!CHA->hasKnownDirectSubclasses(CD)) {
+      switch (CD->getEffectiveAccess()) {
+      case Accessibility::Public:
+        return false;
+      case Accessibility::Internal:
+        if (!M.isWholeModule())
+          return false;
+        break;
+      case Accessibility::Private:
+        break;
+      }
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
 // Attempt to get the instance for S, whose static type is the same as
 // its exact dynamic type, returning a null SILValue() if we cannot find it.
 // The information that a static type is the same as the exact dynamic,
 // can be derived e.g.:
 // - from a constructor or
 // - from a successful outcome of a checked_cast_br [exact] instruction.
-static SILValue getInstanceWithExactDynamicType(SILValue S) {
+static SILValue getInstanceWithExactDynamicType(SILValue S, SILModule &M,
+                                                ClassHierarchyAnalysis *CHA) {
 
   while (S) {
     S = S.stripCasts();
@@ -51,8 +233,15 @@ static SILValue getInstanceWithExactDynamicType(SILValue S) {
       break;
 
     auto *SinglePred = Arg->getParent()->getSinglePredecessor();
-    if (!SinglePred)
-      break;
+    if (!SinglePred) {
+      if (!Arg->isFunctionArg())
+        break;
+      auto *CD = Arg->getType().getClassOrBoundGenericClass();
+      // Check if this class is effectively final.
+      if (!CD || !isKnownFinalClass(CD, M, CHA))
+        break;
+      return Arg;
+    }
 
     // Traverse the chain of predecessors.
     if (isa<BranchInst>(SinglePred->getTerminator()) ||
@@ -102,11 +291,11 @@ static CanType bindSuperclass(CanType Superclass,
 
 // Returns true if any generic types parameters of the class are
 // unbound.
-bool swift::isClassWithUnboundGenericParameters(SILType C, SILModule &M) {
-  auto *CD = C.getClassOrBoundGenericClass();
-  if (CD && CD->getGenericSignature()) {
+bool swift::isNominalTypeWithUnboundGenericParameters(SILType Ty, SILModule &M) {
+  auto *ND = Ty.getNominalOrBoundGenericNominal();
+  if (ND && ND->getGenericSignature()) {
     auto InstanceTypeSubsts =
-        C.gatherAllSubstitutions(M);
+        Ty.gatherAllSubstitutions(M);
 
     if (!InstanceTypeSubsts.empty()) {
       if (hasUnboundGenericTypes(InstanceTypeSubsts))
@@ -114,7 +303,7 @@ bool swift::isClassWithUnboundGenericParameters(SILType C, SILModule &M) {
     }
   }
 
-  if (C.hasArchetype())
+  if (Ty.hasArchetype())
     return true;
 
   return false;
@@ -159,7 +348,7 @@ getSubstitutionsForCallee(SILModule &M, CanSILFunctionType GenCalleeType,
   CanType FSelfClass = GenCalleeType->getSelfParameter().getType();
 
   SILType FSelfSubstType;
-  Module *Module = M.getSwiftModule();
+  auto *Module = M.getSwiftModule();
 
   ArrayRef<Substitution> ClassSubs;
 
@@ -263,12 +452,6 @@ bool swift::canDevirtualizeClassMethod(FullApplySite AI,
   DEBUG(llvm::dbgs() << "    Trying to devirtualize : " << *AI.getInstruction());
 
   SILModule &Mod = AI.getModule();
-
-  // Bail if any generic types parameters of the class instance type are
-  // unbound.
-  // We cannot devirtualize unbound generic calls yet.
-  if (isClassWithUnboundGenericParameters(ClassOrMetatypeType, Mod))
-    return false;
 
   // First attempt to lookup the origin for our class method. The origin should
   // either be a metatype or an alloc_ref.
@@ -598,25 +781,10 @@ DevirtualizationResult swift::tryDevirtualizeWitnessMethod(ApplySite AI) {
 //                              Top Level Driver
 //===----------------------------------------------------------------------===//
 
-/// Return the final class decl based on access control information.
-static bool isKnownFinal(SILModule &M, SILDeclRef Member) {
-  if (!calleesAreStaticallyKnowable(M, Member))
-    return false;
-
-  auto *FD = Member.getAbstractFunctionDecl();
-  assert(FD && "Expected abstract function decl!");
-
-  assert(!FD->isFinal() && "Unexpected indirect call to final method!");
-
-  if (FD->isOverridden())
-    return false;
-
-  return true;
-}
-
 /// Attempt to devirtualize the given apply if possible, and return a
 /// new instruction in that case, or nullptr otherwise.
-DevirtualizationResult swift::tryDevirtualizeApply(FullApplySite AI) {
+DevirtualizationResult
+swift::tryDevirtualizeApply(FullApplySite AI, ClassHierarchyAnalysis *CHA) {
   DEBUG(llvm::dbgs() << "    Trying to devirtualize: " << *AI.getInstruction());
 
   // Devirtualize apply instructions that call witness_method instructions:
@@ -644,13 +812,22 @@ DevirtualizationResult swift::tryDevirtualizeApply(FullApplySite AI) {
   ///
   /// %YY = function_ref @...
   if (auto *CMI = dyn_cast<ClassMethodInst>(AI.getCallee())) {
-    // Check if the class member is known to be final.
-    if (isKnownFinal(CMI->getModule(), CMI->getMember()))
-      return tryDevirtualizeClassMethod(AI, CMI->getOperand());
+    auto &M = AI.getModule();
+    auto Instance = CMI->getOperand().stripUpCasts();
+    auto ClassType = Instance.getType();
+    if (ClassType.is<MetatypeType>())
+      ClassType = ClassType.getMetatypeInstanceType(M);
+
+    auto *CD = ClassType.getClassOrBoundGenericClass();
+
+    if (isEffectivelyFinalMethod(AI, ClassType, CD, CHA))
+      return tryDevirtualizeClassMethod(AI, Instance);
 
     // Try to check if the exact dynamic type of the instance is statically
     // known.
-    if (auto Instance = getInstanceWithExactDynamicType(CMI->getOperand()))
+    if (auto Instance = getInstanceWithExactDynamicType(CMI->getOperand(),
+                                                        CMI->getModule(),
+                                                        CHA))
       return tryDevirtualizeClassMethod(AI, Instance);
   }
 
